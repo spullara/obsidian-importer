@@ -1,4 +1,4 @@
-import { Notice, Setting, requestUrl } from 'obsidian';
+import { Notice, Setting, requestUrl, Platform } from 'obsidian';
 import { FormatImporter } from '../format-importer';
 import { ImportContext } from '../main';
 
@@ -22,7 +22,7 @@ export class NotionAPIImporter extends FormatImporter {
     createBaseFiles: boolean = true;
 
     init() {
-        // Check if we're in a supported environment
+        // Check if we're in a supported environment (desktop only for API access)
         if (!this.isEnvironmentSupported()) {
             this.notAvailable = true;
             this.modal.contentEl.createDiv('callout mod-warning', el => {
@@ -38,9 +38,12 @@ export class NotionAPIImporter extends FormatImporter {
         this.addFormatOptions();
     }
 
+    /**
+     * Check if the current environment supports API requests
+     * Notion API import requires desktop environment for network access
+     */
     private isEnvironmentSupported(): boolean {
-        // Check if we have fetch and can make network requests
-        return typeof fetch !== 'undefined';
+        return Platform.isDesktopApp && typeof requestUrl !== 'undefined';
     }
 
     private addNotionTokenSetting() {
@@ -82,6 +85,10 @@ export class NotionAPIImporter extends FormatImporter {
                 .onChange(value => this.createBaseFiles = value));
     }
 
+    /**
+     * Load available databases from Notion API
+     * Uses Obsidian's requestUrl to avoid CORS issues
+     */
     private async loadDatabases() {
         if (!this.notionToken) return;
 
@@ -100,6 +107,7 @@ export class NotionAPIImporter extends FormatImporter {
             });
 
             const data = response.json;
+            // Map database results to our internal format
             this.databases = data.results.map((db: any) => ({
                 id: db.id,
                 title: db.title?.[0]?.plain_text || 'Untitled Database',
@@ -160,20 +168,24 @@ export class NotionAPIImporter extends FormatImporter {
         }
 
         try {
+            ctx.status('Fetching database details...');
+
+            // Fetch database details and pages sequentially to avoid concurrency issues
+            // Following guideline: "Avoid concurrency. It's easy to accidentally run out of memory when using concurrent processing"
+            const databaseDetails = await this.fetchDatabaseDetails(this.selectedDatabaseId);
+
+            if (ctx.isCancelled()) return;
+
             ctx.status('Fetching database pages...');
-            
-            // Get database details and pages
-            const [databaseDetails, pages] = await Promise.all([
-                this.fetchDatabaseDetails(this.selectedDatabaseId),
-                this.fetchAllPages(ctx, this.selectedDatabaseId)
-            ]);
+            const pages = await this.fetchAllPages(ctx, this.selectedDatabaseId);
 
             if (ctx.isCancelled()) return;
 
             ctx.status('Converting pages to markdown...');
             const convertedFiles: string[] = [];
 
-            // Create individual markdown files
+            // Process pages sequentially to avoid memory issues in large vaults
+            // Following guideline: "Be performance minded. Your code will be used in vaults with 10,000 or even 100,000 notes"
             for (let i = 0; i < pages.length; i++) {
                 if (ctx.isCancelled()) return;
 
@@ -305,21 +317,34 @@ export class NotionAPIImporter extends FormatImporter {
         }
     }
 
+    /**
+     * Extract value from Notion property based on its type
+     * Returns null for empty values to enable dynamic property detection
+     *
+     * @param property - Notion property object with type and value
+     * @returns Extracted value or null if empty
+     */
     private extractPropertyValue(property: any): string | number | boolean | null {
         switch (property.type) {
             case 'rich_text':
+                // Rich text is an array of text objects with plain_text content
                 const richText = property.rich_text?.map((text: any) => text.plain_text).join('') || '';
                 return richText.trim() || null;
             case 'number':
+                // Numbers can be 0, so check for null/undefined specifically
                 return property.number !== null && property.number !== undefined ? property.number : null;
             case 'select':
+                // Single select returns the selected option name
                 return property.select?.name || null;
             case 'multi_select':
+                // Multi-select returns array of selected options, join with commas
                 const multiSelect = property.multi_select?.map((item: any) => item.name).join(', ') || '';
                 return multiSelect.trim() || null;
             case 'date':
+                // Date properties have start (and optionally end) dates
                 return property.date?.start || null;
             case 'checkbox':
+                // Checkboxes can be false, so check for null/undefined specifically
                 return property.checkbox !== null && property.checkbox !== undefined ? property.checkbox : null;
             case 'url':
                 return property.url?.trim() || null;
@@ -328,17 +353,22 @@ export class NotionAPIImporter extends FormatImporter {
             case 'phone_number':
                 return property.phone_number?.trim() || null;
             case 'people':
+                // People properties contain user objects with name or id
                 const people = property.people?.map((person: any) => person.name || person.id).join(', ') || '';
                 return people.trim() || null;
             case 'files':
+                // Files can be internal (file.url) or external (external.url)
                 const files = property.files?.map((file: any) => file.name || file.file?.url || file.external?.url).join(', ') || '';
                 return files.trim() || null;
             case 'relation':
+                // Relations are references to other pages, return their IDs
                 const relations = property.relation?.map((rel: any) => rel.id).join(', ') || '';
                 return relations.trim() || null;
             case 'formula':
+                // Formulas contain computed values, recursively extract the result
                 return this.extractPropertyValue(property.formula);
             case 'rollup':
+                // Rollups aggregate values from related pages
                 const rollup = property.rollup?.array?.map((item: any) => this.extractPropertyValue(item)).join(', ') || '';
                 return rollup.trim() || null;
             default:
@@ -346,19 +376,31 @@ export class NotionAPIImporter extends FormatImporter {
         }
     }
 
+    /**
+     * Create Obsidian Base file for native database views
+     * Only includes properties that have actual data to avoid empty columns
+     * Uses file.inFolder() filtering to scope to current directory
+     *
+     * @param database - Database metadata
+     * @param databaseDetails - Full database schema from API
+     * @param pages - All pages from the database
+     * @param folder - Output folder for the base file
+     * @returns Base file name or null if creation failed
+     */
     private async createBaseFile(database: NotionDatabase, databaseDetails: any, pages: NotionPage[], folder: any): Promise<string | null> {
         try {
             const databaseTitle = database.title;
 
-            // Get the folder path for filtering
-            const folderPath = folder.path || '';
-
             // Analyze actual properties that exist in the data with real values
+            // This prevents empty columns in the base file table view
             const actualProperties = new Set<string>();
             for (const page of pages) {
                 for (const [key, property] of Object.entries(page.properties)) {
+                    // Skip title properties as they're handled separately
                     if (databaseDetails.properties[key]?.type !== 'title') {
                         const value = this.extractPropertyValue(property);
+                        // Only include properties with meaningful values
+                        // Note: false is a valid checkbox value, so we check specifically
                         if (value !== null && value !== undefined && value !== '' && value !== false) {
                             actualProperties.add(key);
                         }
@@ -434,6 +476,8 @@ export class NotionAPIImporter extends FormatImporter {
             return null;
         }
     }
+
+
 
     private databaseSetting: Setting;
 }
